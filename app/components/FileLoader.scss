@@ -55,6 +55,29 @@
   }
 }
 
+.metadata-display {
+  .label {
+    font-weight: bold;
+    color: rgba(255, 255, 255, 0.5);
+    margin-right: 4px;
+  }
+
+  .value {
+    color: rgba(255, 255, 255, 0.7);
+  }
+
+  .separator {
+    color: rgba(255, 255, 255, 0.5);
+  }
+}
+
+.file-pagination-container {
+  margin-top: 30px;
+  margin-bottom: 10px;
+  justify-content: center;
+  display: flex;
+}
+
 .loader {
   margin-top: 48px !important;
 }

@@ -1,5 +1,9 @@
 import {
-  LOAD_ROOT_FOLDER, CHANGE_FOLDER_SELECTION, LOAD_FILES_IN_FOLDER, STORE_SCROLL_POSITION,
+  LOAD_ROOT_FOLDER,
+  CHANGE_FOLDER_SELECTION,
+  LOAD_FILES_IN_FOLDER,
+  STORE_SCROLL_POSITION,
+  CHANGE_PAGE,
 } from '../actions/fileLoader';
 import DolphinManager from '../domain/DolphinManager';
 
@@ -12,6 +16,7 @@ const defaultState = {
   rootFolderPath: "",
   selectedFolderFullPath: "",
   isLoading: false,
+  currentPage: 1,
   folders: {},
   files: [],
   folderFound: false,
@@ -32,6 +37,11 @@ export default function fileLoader(state = defaultState, action) {
     return loadFilesInFolder(state, action);
   case STORE_SCROLL_POSITION:
     return storeScrollPosition(state, action);
+  case CHANGE_PAGE:
+    return {
+      ...state,
+      currentPage: action.payload.newPage,
+    };
   default:
     return state;
   }
