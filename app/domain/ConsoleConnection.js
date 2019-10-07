@@ -1,10 +1,33 @@
+/*
+
+Copyright (C) 2007 Free Software Foundation, Inc. <https://fsf.org/>
+
+This program is free software; you can redistribute it and/or
+modify it under the terms of the GNU Lesser General Public
+License as published by the Free Software Foundation; either
+version 3 of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+Lesser General Public License for more details.
+
+You should have received a copy of the GNU Lesser General Public License
+along with this program; if not, write to the Free Software Foundation,
+Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+
+*/
+
+
 import net from 'net';
 import _ from 'lodash';
+import log from 'electron-log';
 
 import { store } from '../index';
 import { connectionStateChanged } from '../actions/console';
 import DolphinManager from './DolphinManager';
 import SlpFileWriter from './SlpFileWriter';
+import ConsoleCommunication, { types as commMsgTypes } from './ConsoleCommunication';
 
 export const ConnectionStatus = {
   DISCONNECTED: 0,
@@ -32,6 +55,12 @@ export default class ConsoleConnection {
     this.isMirroring = false;
     this.client = null;
     this.connectionStatus = ConnectionStatus.DISCONNECTED;
+    this.connDetails = {
+      gameDataCursor: Uint8Array.from([0, 0, 0, 0, 0, 0, 0, 0]), 
+      consoleNick: "unknown", 
+      version: "",
+      clientToken: 0,
+    }
     this.connectionRetryState = this.getDefaultRetryState();
 
     // A connection can mirror its received gameplay
@@ -66,6 +95,7 @@ export default class ConsoleConnection {
       obsPassword: this.obsPassword,
       isRealTimeMode: this.isRealTimeMode,
       isRelaying: this.isRelaying,
+      consoleNick: this.connDetails.consoleNick,
     };
   }
 
@@ -135,6 +165,9 @@ export default class ConsoleConnection {
     this.connectionStatus = ConnectionStatus.CONNECTING;
     this.forceConsoleUiUpdate();
 
+    // Prepare console communication obj for talking UBJSON
+    const consoleComms = new ConsoleCommunication();
+
     // TODO: reconnect on failed reconnect, not sure how
     // TODO: to do this
     const client = net.connect({
@@ -142,21 +175,45 @@ export default class ConsoleConnection {
       port: this.port || 666,
     }, () => {
       console.log(`Connected to ${this.ipAddress}:${this.port || "666"}!`);
+      clearTimeout(this.connectionRetryState.reconnectHandler);
       this.connectionRetryState = this.getDefaultRetryState();
       this.connectionStatus = ConnectionStatus.CONNECTED;
       this.forceConsoleUiUpdate();
 
-      // TODO: Send message to initiate transfers
+      const handshakeMsgOut = consoleComms.genHandshakeOut(
+        this.connDetails.gameDataCursor, this.connDetails.clientToken
+      );
+
+      // console.log({
+      //   'raw': handshakeMsgOut,
+      //   'string': handshakeMsgOut.toString(),
+      //   'cursor': this.connDetails.gameDataCursor,
+      // });
+      client.write(handshakeMsgOut);
     });
 
     client.setTimeout(20000);
-    
+
+    let commState = "initial";
     client.on('data', (data) => {
-      const result = this.slpFileWriter.handleData(data);
-      if (result.isNewGame) {
-        const curFilePath = this.slpFileWriter.getCurrentFilePath();
-        this.dolphinManager.playFile(curFilePath, false);
+      if (commState === "initial") {
+        commState = this.getInitialCommState(data);
+        log.info(`Connected to source with type: ${commState}`);
+        log.info(data.toString("hex"));
       }
+      
+      if (commState === "legacy") {
+        // If the first message received was not a handshake message, either we
+        // connected to an old Nintendont version or a relay instance
+        this.handleReplayData(data);
+        return;
+      }
+
+      consoleComms.receive(data);
+      const messages = consoleComms.getMessages();
+
+      // Process all of the received messages
+      _.forEach(messages, message => this.processMessage(message));
     });
 
     client.on('timeout', () => {
@@ -165,7 +222,7 @@ export default class ConsoleConnection {
       client.destroy();
 
       // TODO: Fix reconnect logic
-      // if (previouslyConnected) {
+      // if (this.connDetails.token !== "0x00000000") {
       //   // If previously connected, start the reconnect logic
       //   this.startReconnect();
       // }
@@ -210,6 +267,67 @@ export default class ConsoleConnection {
       // TODO: status is set
       this.slpFileWriter.disconnectOBS();
       this.client.destroy();
+    }
+  }
+
+  getInitialCommState(data) {
+    if (data.length < 13) {
+      return "legacy";
+    }
+
+    const openingBytes = Buffer.from([
+      0x7b, 0x69, 0x04, 0x74, 0x79, 0x70, 0x65, 0x55, 0x01,
+    ]);
+
+    const dataStart = data.slice(4, 13);
+    
+    return dataStart.equals(openingBytes) ? "normal" : "legacy";
+  }
+
+  processMessage(message) {
+    switch (message.type) {
+    case commMsgTypes.KEEP_ALIVE:
+      // console.log("Keep alive message received");
+
+      // TODO: This is the jankiest shit ever but it will allow for relay connections not
+      // TODO: to time out as long as the main connection is still receving keep alive messages
+      // TODO: Need to figure out a better solution for this. There should be no need to have an
+      // TODO: active Wii connection for the relay connection to keep itself alive
+      const fakeKeepAlive = Buffer.from("HELO\0");
+      this.slpFileWriter.handleData(fakeKeepAlive);
+      
+      break;
+    case commMsgTypes.REPLAY:
+      // console.log("Replay message type received");
+      // console.log(message.payload.pos);
+      this.connDetails.gameDataCursor = Uint8Array.from(message.payload.pos);
+
+      const data = Uint8Array.from(message.payload.data);
+      this.handleReplayData(data);
+      break;
+    case commMsgTypes.HANDSHAKE:
+      // console.log("Handshake message received");
+      // console.log(message);
+
+      this.connDetails.consoleNick = message.payload.nick;
+      const tokenBuf = Buffer.from(message.payload.clientToken);
+      this.connDetails.clientToken = tokenBuf.readUInt32BE(0);;
+      // console.log(`Received token: ${this.connDetails.clientToken}`);
+
+      // Update file writer to use new console nick?
+      this.slpFileWriter.updateSettings(this.getSettings());
+      break;
+    default:
+      // Should this be an error?
+      break;
+    }
+  }
+
+  handleReplayData(data) {
+    const result = this.slpFileWriter.handleData(data);
+    if (result.isNewGame) {
+      const curFilePath = this.slpFileWriter.getCurrentFilePath();
+      this.dolphinManager.playFile(curFilePath, false);
     }
   }
 

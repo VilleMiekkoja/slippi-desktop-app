@@ -1,3 +1,30 @@
+/*
+
+MIT License
+
+Copyright (c) 2017 jlaferri
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+*/
+
+
 import net from 'net';
 import _ from 'lodash';
 import fs from 'fs-extra';
@@ -19,6 +46,7 @@ export default class SlpFileWriter {
     this.obsSourceName = settings.obsSourceName;
     this.obsIP = settings.obsIP;
     this.id = settings.id;
+    this.consoleNick = settings.consoleNick;
     this.currentFile = this.getClearedCurrentFile();
     this.obs = new OBSWebSocket();
     this.statusOutput = {
@@ -27,15 +55,14 @@ export default class SlpFileWriter {
     };
     this.isRelaying = settings.isRelaying;
     this.clients = [];
-    if (this.isRelaying) {
-      this.startRelay();
-    }
+    this.manageRelay();
   }
 
   getClearedCurrentFile() {
     return {
       payloadSizes: {},
       previousBuffer: Buffer.from([]),
+      fullBuffer: Buffer.from([]),
       path: null,
       writeStream: null,
       bytesWritten: 0,
@@ -47,26 +74,42 @@ export default class SlpFileWriter {
     };
   }
 
-  startRelay = () => {
+  manageRelay() {
     if (!this.isRelaying) {
-      if (this.clients) {
-        _.each(this.clients, (client) => client.destroy());
-      }
+      // If relay has been disabled, clear states
+      const clients = this.clients || [];
+      _.each(clients, (client) => client.destroy());
+
       if (this.server) {
         this.server.close();
       }
+
       this.server = null;
       this.clients = [];
-    } else if (!this.server) {
-      this.server = net.createServer((socket) => {
-        this.clients.push(socket.setNoDelay().setTimeout(10000));
-        socket.on("close", (err) => {
-          if (err) console.log(err);
-          _.remove(this.clients, (client) => socket === client);
-        });
-      });
-      this.server.listen(666 + this.id, '0.0.0.0');
+
+      return;
     }
+    
+    if (this.server) {
+      // If server is already up, no need to start
+      return;
+    }
+    
+    this.server = net.createServer((socket) => {
+      socket.setNoDelay().setTimeout(20000);
+
+      const clientData = {
+        socket: socket,
+        readPos: 0,
+      };
+
+      this.clients.push(clientData);
+      socket.on("close", (err) => {
+        if (err) console.log(err);
+        _.remove(this.clients, (client) => socket === client.socket);
+      });
+    });
+    this.server.listen(1666 + this.id, '0.0.0.0');
   }
 
   getCurrentFilePath() {
@@ -80,7 +123,8 @@ export default class SlpFileWriter {
     this.obsPassword = settings.obsPassword;
     this.id = settings.id;
     this.isRelaying = settings.isRelaying;
-    this.startRelay();
+    this.consoleNick = settings.consoleNick || this.consoleNick;
+    this.manageRelay();
   }
 
   getSceneSources = async (data = null) => { // eslint-disable-line
@@ -154,10 +198,6 @@ export default class SlpFileWriter {
       newData,
     ]));
 
-    if (this.clients) {
-      _.each(this.clients, (client) => client.write(newData));
-    }
-
     const dataView = new DataView(data.buffer);
 
     let index = 0;
@@ -223,6 +263,21 @@ export default class SlpFileWriter {
       index += payloadLen;
     }
 
+    // Write data to relay, we do this after processing in the case there is a new game, we need
+    // to have the buffer ready
+    this.currentFile.fullBuffer = Buffer.concat([this.currentFile.fullBuffer, newData]);
+
+    if (this.clients) {
+      const buf = this.currentFile.fullBuffer;
+      _.each(this.clients, (client) => {
+        client.socket.write(buf.slice(client.readPos));
+
+        // eslint doesn't like the following line... I feel like it's a valid use case but idk,
+        // maybe there's risks with doing this?
+        client.readPos = buf.byteLength; // eslint-disable-line
+      });
+    }
+
     return {
       isNewGame: isNewGame,
       isGameEnd: isGameEnd,
@@ -265,6 +320,12 @@ export default class SlpFileWriter {
         startTime: startTime,
       },
     };
+
+    // Clear clients back to position zero
+    this.clients = _.map(this.clients, client => ({
+      ...client,
+      readPos: 0,
+    }));
 
     const header = Buffer.concat([
       Buffer.from("{U"),
@@ -316,6 +377,17 @@ export default class SlpFileWriter {
       Buffer.from([9]),
       Buffer.from("lastFramel"),
       this.createInt32Buffer(lastFrame),
+    ]);
+
+    // write the Console Nickname
+    const consoleNick = this.consoleNick;
+    footer = Buffer.concat([
+      footer,
+      Buffer.from("U"),
+      Buffer.from([11]),
+      Buffer.from("consoleNickSU"),
+      Buffer.from([consoleNick.length]),
+      Buffer.from(consoleNick),
     ]);
 
     // Start writting player specific data
